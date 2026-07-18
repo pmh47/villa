@@ -168,7 +168,8 @@ void ViewerCompositePanel::setupVolumetricControls(QVBoxLayout* layout)
     _volumetricWScale->setToolTip(
         tr("Relief exaggeration: stretches the slab along the surface normal "
            "before the tilted render, making height variation visible on wide "
-           "flat segments"));
+           "flat segments. Flattened view only — slice views render their "
+           "slab unstretched"));
     form->addRow(tr("W scale"), _volumetricWScale);
 
     auto* perspectiveRow = new QHBoxLayout();
@@ -190,17 +191,20 @@ void ViewerCompositePanel::setupVolumetricControls(QVBoxLayout* layout)
     _volumetricAzimuth->setWrapping(true);
     _volumetricAzimuth->setSuffix(QStringLiteral("°"));
     _volumetricAzimuth->setToolTip(
-        tr("Azimuth: spins the patch in the view plane; "
-           "the on-view pad edits this too"));
+        tr("Azimuth: spins the patch in the view plane. Flattened view only — "
+           "each slice view has its own camera, edited via its on-view pad "
+           "(double-click a pane there to reset)"));
     _volumetricTilt = new QDoubleSpinBox(_volumetricGroup);
     _volumetricTilt->setRange(0.0, 45.0);
     _volumetricTilt->setDecimals(1);
     _volumetricTilt->setSuffix(QStringLiteral("°"));
     _volumetricTilt->setToolTip(
         tr("Tilt: tips the camera from straight down (0) toward flat; on "
-           "screen always toward the top edge. The on-view pad edits this too"));
+           "screen always toward the top edge. Flattened view only — slice "
+           "views use their own on-view pads"));
     auto* resetButton = new QPushButton(tr("Reset"), _volumetricGroup);
-    resetButton->setToolTip(tr("Reset the camera to straight down the surface normal"));
+    resetButton->setToolTip(tr("Reset the flattened view's camera to straight "
+                               "down the surface normal"));
     cameraRow->addWidget(new QLabel(tr("Az"), _volumetricGroup));
     cameraRow->addWidget(_volumetricAzimuth, 1);
     cameraRow->addWidget(new QLabel(tr("Tilt"), _volumetricGroup));
@@ -212,14 +216,21 @@ void ViewerCompositePanel::setupVolumetricControls(QVBoxLayout* layout)
     layout->insertWidget(3, _volumetricGroup);
     _volumetricGroup->setVisible(false);
 
+    // The volumetric mode is available in the plane (slice) views too. The
+    // transfer-function params are shared (they go to every viewer, like the
+    // method combo), but the camera is per-view: the panel's camera controls
+    // map to the flattened segmentation view only, and each viewer's on-view
+    // gizmo edits its own camera (double-click a pane to reset it).
     connect(_volumetricGamma, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, [this](double value) {
-        applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+        applyToAllViewers([value](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.params.tfGamma = float(value);
             viewer->setCompositeRenderSettings(s);
         });
     });
+    // W scale is flattened-view-only (the slice slab has no relief to
+    // exaggerate); the render path ignores it for plane views regardless.
     connect(_volumetricWScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, [this](double value) {
         applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
@@ -308,9 +319,13 @@ void ViewerCompositePanel::setupControls()
             });
         });
     }
+    // The alpha/opacity params and stack direction feed the plane-view
+    // composites too (scalar alpha and volumetric TF), so they go to every
+    // viewer. The layer counts stay per-scope (layersFront/Behind vs
+    // planeLayersFront/Behind).
     if (_uiRefs.alphaMin) {
         connect(_uiRefs.alphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+            applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
                 s.params.alphaMin = value / 255.0f;
                 viewer->setCompositeRenderSettings(s);
@@ -319,7 +334,7 @@ void ViewerCompositePanel::setupControls()
     }
     if (_uiRefs.alphaMax) {
         connect(_uiRefs.alphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+            applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
                 s.params.alphaMax = value / 255.0f;
                 viewer->setCompositeRenderSettings(s);
@@ -328,7 +343,7 @@ void ViewerCompositePanel::setupControls()
     }
     if (_uiRefs.alphaThreshold) {
         connect(_uiRefs.alphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+            applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
                 s.params.alphaCutoff = value / 10000.0f;
                 viewer->setCompositeRenderSettings(s);
@@ -337,7 +352,7 @@ void ViewerCompositePanel::setupControls()
     }
     if (_uiRefs.material) {
         connect(_uiRefs.material, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+            applyToAllViewers([value](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
                 s.params.alphaOpacity = value / 255.0f;
                 viewer->setCompositeRenderSettings(s);
@@ -346,7 +361,7 @@ void ViewerCompositePanel::setupControls()
     }
     if (_uiRefs.reverseDirection) {
         connect(_uiRefs.reverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
-            applyToSegmentationViewer([checked](VolumeViewerBase* viewer) {
+            applyToAllViewers([checked](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
                 s.reverseDirection = checked;
                 viewer->setCompositeRenderSettings(s);
@@ -467,20 +482,25 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
     if (_volumetricWScale) {
         s.params.wScale = float(_volumetricWScale->value());
     }
-    if (_volumetricPerspective) {
-        s.params.camPerspective = _volumetricPerspective->value() / 100.0f;
-    }
-    if (_volumetricAzimuth) {
-        s.params.camAzimuthDeg = float(_volumetricAzimuth->value());
-    }
-    if (_volumetricTilt) {
-        s.params.camTiltDeg = float(_volumetricTilt->value());
+    // The camera is per-view; the panel's camera controls belong to the
+    // flattened segmentation view only. Other viewers keep their own camera
+    // (default straight-down), edited via their on-view gizmo.
+    if (viewer->surfName() == "segmentation") {
+        if (_volumetricPerspective) {
+            s.params.camPerspective = _volumetricPerspective->value() / 100.0f;
+        }
+        if (_volumetricAzimuth) {
+            s.params.camAzimuthDeg = float(_volumetricAzimuth->value());
+        }
+        if (_volumetricTilt) {
+            s.params.camTiltDeg = float(_volumetricTilt->value());
+        }
     }
     viewer->setCompositeRenderSettings(s);
     if (viewer->surfName() == "segmentation") {
         setSegmentationCompositeChecked(s.enabled);
-        // Keep the panel's yaw/pitch/perspective readouts live while the
-        // on-view gizmo edits the camera.
+        // Keep the panel's camera readouts live while the flattened view's
+        // on-view gizmo edits its camera.
         viewer->connectCompositeCameraChanged(this, [this]() {
             syncVolumetricCameraFromViewer();
         });

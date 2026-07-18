@@ -1403,9 +1403,13 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
 bool CChunkedVolumeViewer::volumetricCameraActive() const
 {
     auto surf = _surfWeak.lock();
-    return _compositeSettings.enabled &&
-           _compositeSettings.params.method == "volumetric" &&
-           surf && dynamic_cast<PlaneSurface*>(surf.get()) == nullptr;
+    if (!surf || _compositeSettings.params.method != "volumetric")
+        return false;
+    // Plane (slice) views gate on the per-plane composite toggle, the
+    // flattened view on the main one — matching the render dispatch.
+    return dynamic_cast<PlaneSurface*>(surf.get())
+               ? _compositeSettings.planeEnabled
+               : _compositeSettings.enabled;
 }
 
 cv::Matx22f CChunkedVolumeViewer::volumetricScreenToSurface() const
@@ -1430,6 +1434,12 @@ void CChunkedVolumeViewer::updateCameraGizmo()
     _cameraGizmo->setCamera(_compositeSettings.params.camAzimuthDeg,
                             _compositeSettings.params.camTiltDeg,
                             _compositeSettings.params.camPerspective);
+    // Plane views draw their tilt handle in the bottom-right corner (46 px
+    // square, 14 px margin — CVolumeViewerView::tiltHandleRect); sit to its
+    // left there.
+    auto surf = _surfWeak.lock();
+    const bool planeView = surf && dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
+    _cameraGizmo->setRightInset(planeView ? 60 : 0);
     _cameraGizmo->setVisible(volumetricCameraActive());
 }
 
@@ -1545,6 +1555,45 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     };
     const bool volumetricMethod = ctx.compositeSettings.params.method == "volumetric";
 
+    // Volumetric mode: composite a sampled layer stack front-to-back along
+    // tilted view rays with a transfer function. Output is an already-
+    // colormapped RGB buffer; the blit skips the scalar LUT for it. Shared by
+    // the flattened-surface and plane (slice) paths — layer i sits at
+    // w = zStart + i in slab space either way.
+    auto compositeVolumetricStack = [&](const std::vector<cv::Mat_<uint8_t>>& layerValues,
+                                        const std::vector<cv::Mat_<uint8_t>>& layerCoverage,
+                                        int zStart,
+                                        bool exaggerateW,
+                                        cv::Mat_<cv::Vec3b>& colorDst,
+                                        cv::Mat_<uint8_t>& cov) {
+        const auto& cs = ctx.compositeSettings;
+        vc3d::volumetric::CameraParams cam;
+        cam.azimuthDeg = cs.params.camAzimuthDeg;
+        cam.tiltDeg = cs.params.camTiltDeg;
+        cam.perspective = cs.params.camPerspective;
+
+        std::array<uint32_t, 256> colorLut{};
+        vc::buildWindowLevelColormapLut(colorLut, ctx.windowLow, ctx.windowHigh,
+                                        ctx.baseColormapId);
+        // Ray-segment length correction 1/|d_w| so tilted views don't look
+        // artificially transparent (per-frame constant: parallel rays).
+        const auto dir = vc3d::volumetric::viewDirection(cam);
+        const float segLen = 1.0f / std::max(dir[2], 1e-3f);
+        const auto opacityLut = vc3d::volumetric::buildOpacityLut(
+            cs.params.alphaMin, cs.params.alphaMax, cs.params.alphaOpacity,
+            cs.params.tfGamma, cs.params.isoCutoff, segLen);
+
+        // W scaling exaggerates the relief: the layer planes spread apart
+        // along the normal before the rotated render (the in-plane content
+        // and the sampling itself are untouched). Flattened view only —
+        // a slice slab has no surface relief worth amplifying.
+        const float wScale = exaggerateW ? std::max(cs.params.wScale, 0.01f) : 1.0f;
+        vc3d::volumetric::compositeVolumetric(layerValues, layerCoverage, cam,
+                                              zStart, ctx.scale * wScale,
+                                              colorLut, opacityLut,
+                                              colorDst, cov);
+    };
+
     auto samplePlane = [&](const cv::Vec3f& origin,
                            const cv::Vec3f& vxStep,
                            const cv::Vec3f& vyStep,
@@ -1552,10 +1601,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                            cv::Mat_<uint8_t>& dst,
                            cv::Mat_<uint8_t>& cov,
                            vc::render::ChunkCache& array) {
-        // Plane views don't get the volumetric mode: fall back to single-slice.
         const bool wantComposite = ctx.compositeSettings.planeEnabled &&
-                                   !streamingCompositeUnsupported() &&
-                                   !volumetricMethod;
+                                   !streamingCompositeUnsupported();
         if (!wantComposite) {
             vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
@@ -1579,6 +1626,14 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 array, ctx.startLevel, layerOrigin, vxStep, vyStep,
                 layerValues.back(), layerCoverage.back(), compositeOptions);
+        }
+        if (volumetricMethod) {
+            // The plane slab is a genuinely rigid stack, so the tilted
+            // orthographic/pinhole render is exact here (no bendy-slab
+            // approximation).
+            compositeVolumetricStack(layerValues, layerCoverage, zStart,
+                                     /*exaggerateW=*/false, colorValues, cov);
+            return;
         }
         LayerStack stack;
         stack.values.resize(numLayers);
@@ -1683,9 +1738,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
     };
 
-    // Volumetric mode: same layer stack as the scalar composite, but composited
-    // front-to-back along tilted view rays with a transfer function. Output is
-    // an already-colormapped RGB buffer; the blit skips the scalar LUT for it.
+    // Volumetric mode, flattened-surface path: same layer stack as the scalar
+    // composite, handed to the shared volumetric compositing tail.
     auto sampleCoordsVolumetric = [&](const cv::Mat_<cv::Vec3f>& coords,
                                       const cv::Mat_<cv::Vec3f>& normals,
                                       cv::Mat_<cv::Vec3b>& colorDst,
@@ -1701,31 +1755,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         std::vector<cv::Mat_<uint8_t>> layerCoverage;
         generateLayerStack(coords, normals, array, ctx.startLevel,
                            numLayers, zStart, zStep, layerValues, layerCoverage);
-
-        vc3d::volumetric::CameraParams cam;
-        cam.azimuthDeg = cs.params.camAzimuthDeg;
-        cam.tiltDeg = cs.params.camTiltDeg;
-        cam.perspective = cs.params.camPerspective;
-
-        std::array<uint32_t, 256> colorLut{};
-        vc::buildWindowLevelColormapLut(colorLut, ctx.windowLow, ctx.windowHigh,
-                                        ctx.baseColormapId);
-        // Ray-segment length correction 1/|d_w| so tilted views don't look
-        // artificially transparent (per-frame constant: parallel rays).
-        const auto dir = vc3d::volumetric::viewDirection(cam);
-        const float segLen = 1.0f / std::max(dir[2], 1e-3f);
-        const auto opacityLut = vc3d::volumetric::buildOpacityLut(
-            cs.params.alphaMin, cs.params.alphaMax, cs.params.alphaOpacity,
-            cs.params.tfGamma, cs.params.isoCutoff, segLen);
-
-        // W scaling exaggerates the relief: the layer planes spread apart
-        // along the normal before the rotated render (the in-plane content
-        // and the sampling itself are untouched).
-        const float wScale = std::max(cs.params.wScale, 0.01f);
-        vc3d::volumetric::compositeVolumetric(layerValues, layerCoverage, cam,
-                                              zStart, ctx.scale * wScale,
-                                              colorLut, opacityLut,
-                                              colorDst, cov);
+        compositeVolumetricStack(layerValues, layerCoverage, zStart,
+                                 /*exaggerateW=*/true, colorDst, cov);
     };
 
     auto sampleCoords = [&](const cv::Mat_<cv::Vec3f>& coords,
@@ -5160,14 +5191,16 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
         items << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
-    } else if (_compositeSettings.enabled &&
-               _compositeSettings.params.method == "volumetric") {
+    } else if (volumetricCameraActive()) {
         QString volumetric = QString("composite volumetric az %1 tilt %2")
                                  .arg(_compositeSettings.params.camAzimuthDeg, 0, 'f', 0)
                                  .arg(_compositeSettings.params.camTiltDeg, 0, 'f', 0);
         if (_compositeSettings.params.camPerspective > 0.0f)
             volumetric += QString(" persp %1").arg(_compositeSettings.params.camPerspective, 0, 'f', 2);
-        if (_compositeSettings.params.wScale != 1.0f)
+        // W scaling only applies to the flattened view's bendy slab.
+        auto surf = _surfWeak.lock();
+        const bool planeView = surf && dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
+        if (!planeView && _compositeSettings.params.wScale != 1.0f)
             volumetric += QString(" w×%1").arg(_compositeSettings.params.wScale, 0, 'f', 1);
         items << volumetric;
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {

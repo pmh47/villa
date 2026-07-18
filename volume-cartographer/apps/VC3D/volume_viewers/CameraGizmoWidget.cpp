@@ -43,6 +43,14 @@ void CameraGizmoWidget::setCamera(float azimuthDeg, float tiltDeg, float perspec
     update();
 }
 
+void CameraGizmoWidget::setRightInset(int inset)
+{
+    if (_rightInset == inset)
+        return;
+    _rightInset = inset;
+    repositionInParent();
+}
+
 QPointF CameraGizmoWidget::azimuthCenter() const
 {
     return QPointF(kPaneSize * 0.5, height() * 0.5);
@@ -250,6 +258,7 @@ bool CameraGizmoWidget::eventFilter(QObject* watched, QEvent* event)
 void CameraGizmoWidget::repositionInParent()
 {
     if (auto* p = parentWidget()) {
-        move(p->width() - width() - kMargin, p->height() - height() - kMargin);
+        move(p->width() - width() - kMargin - _rightInset,
+             p->height() - height() - kMargin);
     }
 }

@@ -28,6 +28,18 @@ nonzero tilt the w=0 plane is no longer pixel-identical to the untilted view (co
 compresses by cos(tilt) across the tilt axis), so scene overlays only align exactly at zero
 tilt.
 
+Extension (2026-07): the mode also works in the plane (slice) views, contrary to the
+original flattened-view-only scope below. The slice slab is the same layer stack the plane
+scalar composite samples (`planeLayersFront/Behind` around the slice plane), handed to the
+same `VolumetricCompositor` — and since that slab is genuinely rigid, the tilted render is
+exact there (no bendy-slab approximation). Gating follows the per-plane composite
+checkboxes; the gizmo appears in each active viewer (shifted left of the plane tilt
+handle). The camera is per-view: the panel's camera spinners/slider/reset map to the
+flattened view only, while each slice view's camera is edited via its own gizmo
+(double-click a pane to reset it). The transfer-function params (alpha window, opacity,
+gamma) stay shared across viewers. `wScale` stays flattened-view-only — a slice slab has
+no surface relief to exaggerate.
+
 ## Goal
 
 Add a new compositing mode to the flattened-segment (generated-surface) view in VC3D that

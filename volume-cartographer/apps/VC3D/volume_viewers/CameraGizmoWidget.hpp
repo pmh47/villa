@@ -22,6 +22,9 @@ public:
 
     // Update the displayed state without emitting cameraChanged.
     void setCamera(float azimuthDeg, float tiltDeg, float perspective);
+    // Extra space kept free to the right (e.g. for the plane views'
+    // tilt handle, which also lives in the bottom-right corner).
+    void setRightInset(int inset);
     float azimuthDeg() const { return _azimuthDeg; }
     float tiltDeg() const { return _tiltDeg; }
     float perspective() const { return _perspective; }
@@ -51,5 +54,6 @@ private:
     float _tiltDeg = 0.0f;
     float _perspective = 0.0f;
     int _wheelAccum = 0;
+    int _rightInset = 0;
     Pane _dragPane = Pane::None;
 };
