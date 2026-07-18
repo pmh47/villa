@@ -1,6 +1,32 @@
 # Plan: Perspective volumetric compositing mode for the VC3D flattened-segment view
 
-Status: **proposal — not implemented**
+Status: **implemented, revised** (phases 1–4; see `apps/VC3D/volume_viewers/VolumetricCompositor.{hpp,cpp}`,
+`CameraGizmoWidget.{hpp,cpp}`, the volumetric branch in `CChunkedVolumeViewer.cpp`, and
+`core/test/test_volumetric_compositor.cpp`. Persistence was skipped — the existing composite
+settings aren't persisted either. The optional Shift+drag rotate and row-parallel compositing
+remain future work.)
+
+Revision (2026-07): the original camera model below (output raster pinned to the w=0 plane,
+per-layer parallax shifts, perspective-strength control) produced visibly wrong geometry
+beyond a few degrees of tilt — layers shear but never foreshorten, so the slab doesn't read
+as a rotating object. The implementation instead uses a **true orthographic render of the
+rigidly rotated slab**: parallel rays along the tilted view direction with an orthonormal
+screen basis, rotation centered on the view center at w=0. Per layer this is still one
+affine map (a 2×2 matrix shared by all layers — the cos(tilt) foreshortening — plus a
+per-layer w·tan(tilt) offset), so the cost is unchanged. The camera is a turntable:
+azimuth spins the patch about the surface normal (a pure in-plane rotation of the image,
+even at zero tilt) and tilt then tips the view about the screen-horizontal axis (always a
+vertical foreshortening on screen; GUI-limited to 45°). The two are edited independently
+by a two-pane gizmo: an azimuth compass dial and a true-angle elevation gauge.
+Perspective is a true pinhole camera on the tilted view axis: the slider maps to a half-FOV
+of `perspective · 45°`, and the focal length equals the camera distance so magnification is
+exactly 1 on the plane through the view center perpendicular to the view axis — switching
+ortho ↔ perspective preserves the central ray and the coverage at that anchor depth
+(perspective then magnifies nearer layers and shrinks farther ones). A `wScale` relief
+exaggeration factor stretches the slab along the normal before the render. Consequence: at
+nonzero tilt the w=0 plane is no longer pixel-identical to the untilted view (content
+compresses by cos(tilt) across the tilt axis), so scene overlays only align exactly at zero
+tilt.
 
 ## Goal
 

@@ -6,7 +6,9 @@
 
 // Parameters for multi-layer compositing
 struct CompositeParams {
-    // Compositing method: "mean", "max", "min", "alpha", "beerLambert"
+    // Compositing method: "mean", "max", "min", "alpha", "beerLambert",
+    // "volumetric" (GUI-only perspective volumetric mode; ignored by the
+    // shared compositeLayerStack dispatch)
     std::string method = "mean";
 
     // Alpha compositing parameters
@@ -22,6 +24,24 @@ struct CompositeParams {
 
     // Pre-processing
     uint8_t isoCutoff = 0;           // Highpass filter: values below this are set to 0
+
+    // Volumetric mode camera + transfer function (GUI viewer only; unused by
+    // the CLI/scalar methods). Turntable model: camAzimuthDeg spins the patch
+    // about the surface normal (a pure in-plane rotation of the image);
+    // camTiltDeg then tips the view about the screen-horizontal axis, from
+    // straight down (0) toward flat — on screen always a vertical
+    // foreshortening. camPerspective 0 = orthographic, (0..1] = pinhole
+    // perspective with half-FOV = camPerspective * 45deg (coverage matched to
+    // orthographic at the view-center depth). tfGamma shapes the opacity
+    // transfer function.
+    float camAzimuthDeg = 0.0f;
+    float camTiltDeg = 0.0f;
+    float camPerspective = 0.0f;
+    float tfGamma = 1.5f;
+    // Relief exaggeration: stretches the slab along the normal (w) axis
+    // before the rotated render. Segments are typically much wider than the
+    // slab is thick, so 1:1 relief is barely visible under tilt.
+    float wScale = 2.5f;
 
     bool operator==(const CompositeParams&) const = default;
 };

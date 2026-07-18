@@ -5,13 +5,19 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QHBoxLayout>
 #include <QLabel>
+#include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QSpinBox>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 
 namespace
@@ -24,6 +30,7 @@ std::string compositeMethodForModeIndex(int index)
         case 1:  return "mean";
         case 2:  return "min";
         case 3:  return "alpha";
+        case 4:  return "volumetric";
         default: return "mean";
     }
 }
@@ -34,6 +41,7 @@ int compositeModeIndexForMethod(const std::string& method)
     if (method == "mean") return 1;
     if (method == "min") return 2;
     if (method == "alpha") return 3;
+    if (method == "volumetric") return 4;
     return 1;
 }
 
@@ -104,9 +112,11 @@ ViewerCompositePanel::ViewerCompositePanel(const UiRefs& uiRefs,
         _uiRefs.compositeMode->addItem(tr("Mean"));
         _uiRefs.compositeMode->addItem(tr("Minimum"));
         _uiRefs.compositeMode->addItem(tr("Alpha"));
+        _uiRefs.compositeMode->addItem(tr("Volumetric"));
         _uiRefs.compositeMode->setCurrentIndex(compositeModeIndexForMethod("max"));
     }
 
+    setupVolumetricControls(layout);
     setupControls();
     initializeExistingViewers();
 
@@ -133,6 +143,127 @@ void ViewerCompositePanel::setSegmentationCompositeChecked(bool checked)
     }
     QSignalBlocker blocker(_uiRefs.compositeEnabled);
     _uiRefs.compositeEnabled->setChecked(checked);
+}
+
+void ViewerCompositePanel::setupVolumetricControls(QVBoxLayout* layout)
+{
+    _volumetricGroup = new QWidget(this);
+    auto* form = new QFormLayout(_volumetricGroup);
+    form->setContentsMargins(0, 2, 0, 2);
+    form->setHorizontalSpacing(4);
+    form->setVerticalSpacing(2);
+
+    _volumetricGamma = new QDoubleSpinBox(_volumetricGroup);
+    _volumetricGamma->setRange(0.1, 5.0);
+    _volumetricGamma->setSingleStep(0.1);
+    _volumetricGamma->setValue(1.5);
+    _volumetricGamma->setToolTip(tr("Opacity transfer function gamma (alpha = opacity · ρ^γ)"));
+    form->addRow(tr("Gamma"), _volumetricGamma);
+
+    _volumetricWScale = new QDoubleSpinBox(_volumetricGroup);
+    _volumetricWScale->setRange(0.1, 20.0);
+    _volumetricWScale->setSingleStep(0.5);
+    _volumetricWScale->setValue(2.5);
+    _volumetricWScale->setSuffix(QStringLiteral("×"));
+    _volumetricWScale->setToolTip(
+        tr("Relief exaggeration: stretches the slab along the surface normal "
+           "before the tilted render, making height variation visible on wide "
+           "flat segments"));
+    form->addRow(tr("W scale"), _volumetricWScale);
+
+    auto* perspectiveRow = new QHBoxLayout();
+    _volumetricPerspective = new QSlider(Qt::Horizontal, _volumetricGroup);
+    _volumetricPerspective->setRange(0, 100);
+    _volumetricPerspective->setValue(0);
+    _volumetricPerspective->setToolTip(
+        tr("Perspective strength: 0 = orthographic, 1 = 90° field of view. "
+           "Coverage at the view-center depth stays matched to orthographic."));
+    _volumetricPerspectiveValue = new QLabel(QStringLiteral("0.00"), _volumetricGroup);
+    perspectiveRow->addWidget(_volumetricPerspective, 1);
+    perspectiveRow->addWidget(_volumetricPerspectiveValue);
+    form->addRow(tr("Perspective"), perspectiveRow);
+
+    auto* cameraRow = new QHBoxLayout();
+    _volumetricAzimuth = new QDoubleSpinBox(_volumetricGroup);
+    _volumetricAzimuth->setRange(-180.0, 180.0);
+    _volumetricAzimuth->setDecimals(1);
+    _volumetricAzimuth->setWrapping(true);
+    _volumetricAzimuth->setSuffix(QStringLiteral("°"));
+    _volumetricAzimuth->setToolTip(
+        tr("Azimuth: spins the patch in the view plane; "
+           "the on-view pad edits this too"));
+    _volumetricTilt = new QDoubleSpinBox(_volumetricGroup);
+    _volumetricTilt->setRange(0.0, 45.0);
+    _volumetricTilt->setDecimals(1);
+    _volumetricTilt->setSuffix(QStringLiteral("°"));
+    _volumetricTilt->setToolTip(
+        tr("Tilt: tips the camera from straight down (0) toward flat; on "
+           "screen always toward the top edge. The on-view pad edits this too"));
+    auto* resetButton = new QPushButton(tr("Reset"), _volumetricGroup);
+    resetButton->setToolTip(tr("Reset the camera to straight down the surface normal"));
+    cameraRow->addWidget(new QLabel(tr("Az"), _volumetricGroup));
+    cameraRow->addWidget(_volumetricAzimuth, 1);
+    cameraRow->addWidget(new QLabel(tr("Tilt"), _volumetricGroup));
+    cameraRow->addWidget(_volumetricTilt, 1);
+    cameraRow->addWidget(resetButton);
+    form->addRow(tr("Camera"), cameraRow);
+
+    // Right after the shared composite grid (checkbox, mode row, params grid).
+    layout->insertWidget(3, _volumetricGroup);
+    _volumetricGroup->setVisible(false);
+
+    connect(_volumetricGamma, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double value) {
+        applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.tfGamma = float(value);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(_volumetricWScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double value) {
+        applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.wScale = float(value);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(_volumetricPerspective, &QSlider::valueChanged, this, [this](int value) {
+        const float perspective = float(value) / 100.0f;
+        _volumetricPerspectiveValue->setText(QString::number(perspective, 'f', 2));
+        applyToSegmentationViewer([perspective](VolumeViewerBase* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.camPerspective = perspective;
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    const auto applyCameraAngle = [this](float CompositeParams::* field) {
+        return [this, field](double value) {
+            applyToSegmentationViewer([value, field](VolumeViewerBase* viewer) {
+                auto s = viewer->compositeRenderSettings();
+                s.params.*field = float(value);
+                viewer->setCompositeRenderSettings(s);
+            });
+        };
+    };
+    connect(_volumetricAzimuth, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, applyCameraAngle(&CompositeParams::camAzimuthDeg));
+    connect(_volumetricTilt, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, applyCameraAngle(&CompositeParams::camTiltDeg));
+    connect(resetButton, &QPushButton::clicked, this, [this]() {
+        {
+            QSignalBlocker azBlocker(_volumetricAzimuth);
+            QSignalBlocker tiltBlocker(_volumetricTilt);
+            _volumetricAzimuth->setValue(0.0);
+            _volumetricTilt->setValue(0.0);
+        }
+        applyToSegmentationViewer([](VolumeViewerBase* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.camAzimuthDeg = 0.0f;
+            s.params.camTiltDeg = 0.0f;
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
 }
 
 void ViewerCompositePanel::setupControls()
@@ -297,11 +428,62 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
     if (!viewer) {
         return;
     }
+    // Push the full control state, not just the method: the .ui defaults
+    // (e.g. alpha min 170) differ from the CompositeParams defaults, and a
+    // control that is never touched would otherwise display a value the
+    // viewer isn't using.
     auto s = viewer->compositeRenderSettings();
     s.params.method = compositeMethodForModeIndex(_uiRefs.compositeMode ? _uiRefs.compositeMode->currentIndex() : 0);
+    if (_uiRefs.layersInFront) {
+        s.layersFront = _uiRefs.layersInFront->value();
+    }
+    if (_uiRefs.layersBehind) {
+        s.layersBehind = _uiRefs.layersBehind->value();
+    }
+    if (_uiRefs.alphaMin) {
+        s.params.alphaMin = _uiRefs.alphaMin->value() / 255.0f;
+    }
+    if (_uiRefs.alphaMax) {
+        s.params.alphaMax = _uiRefs.alphaMax->value() / 255.0f;
+    }
+    if (_uiRefs.alphaThreshold) {
+        s.params.alphaCutoff = _uiRefs.alphaThreshold->value() / 10000.0f;
+    }
+    if (_uiRefs.material) {
+        s.params.alphaOpacity = _uiRefs.material->value() / 255.0f;
+    }
+    if (_uiRefs.reverseDirection) {
+        s.reverseDirection = _uiRefs.reverseDirection->isChecked();
+    }
+    if (_uiRefs.planeLayersFront) {
+        s.planeLayersFront = std::max(0, _uiRefs.planeLayersFront->value());
+    }
+    if (_uiRefs.planeLayersBehind) {
+        s.planeLayersBehind = std::max(0, _uiRefs.planeLayersBehind->value());
+    }
+    if (_volumetricGamma) {
+        s.params.tfGamma = float(_volumetricGamma->value());
+    }
+    if (_volumetricWScale) {
+        s.params.wScale = float(_volumetricWScale->value());
+    }
+    if (_volumetricPerspective) {
+        s.params.camPerspective = _volumetricPerspective->value() / 100.0f;
+    }
+    if (_volumetricAzimuth) {
+        s.params.camAzimuthDeg = float(_volumetricAzimuth->value());
+    }
+    if (_volumetricTilt) {
+        s.params.camTiltDeg = float(_volumetricTilt->value());
+    }
     viewer->setCompositeRenderSettings(s);
     if (viewer->surfName() == "segmentation") {
         setSegmentationCompositeChecked(s.enabled);
+        // Keep the panel's yaw/pitch/perspective readouts live while the
+        // on-view gizmo edits the camera.
+        viewer->connectCompositeCameraChanged(this, [this]() {
+            syncVolumetricCameraFromViewer();
+        });
     }
 }
 
@@ -309,15 +491,42 @@ void ViewerCompositePanel::updateCompositeParamsVisibility()
 {
     const int methodIndex = _uiRefs.compositeMode ? _uiRefs.compositeMode->currentIndex() : 0;
     const bool isAlpha = methodIndex == 3;
+    const bool isVolumetric = methodIndex == 4;
 
-    setWidgetVisible(_uiRefs.alphaMinLabel, isAlpha);
-    setWidgetVisible(_uiRefs.alphaMin, isAlpha);
-    setWidgetVisible(_uiRefs.alphaMaxLabel, isAlpha);
-    setWidgetVisible(_uiRefs.alphaMax, isAlpha);
+    // The volumetric opacity TF reuses the alpha window and opacity rows;
+    // the cutoff threshold is alpha-only.
+    setWidgetVisible(_uiRefs.alphaMinLabel, isAlpha || isVolumetric);
+    setWidgetVisible(_uiRefs.alphaMin, isAlpha || isVolumetric);
+    setWidgetVisible(_uiRefs.alphaMaxLabel, isAlpha || isVolumetric);
+    setWidgetVisible(_uiRefs.alphaMax, isAlpha || isVolumetric);
     setWidgetVisible(_uiRefs.alphaThresholdLabel, isAlpha);
     setWidgetVisible(_uiRefs.alphaThreshold, isAlpha);
-    setWidgetVisible(_uiRefs.materialLabel, isAlpha);
-    setWidgetVisible(_uiRefs.material, isAlpha);
+    setWidgetVisible(_uiRefs.materialLabel, isAlpha || isVolumetric);
+    setWidgetVisible(_uiRefs.material, isAlpha || isVolumetric);
+    setWidgetVisible(_volumetricGroup, isVolumetric);
+}
+
+void ViewerCompositePanel::syncVolumetricCameraFromViewer()
+{
+    applyToSegmentationViewer([this](VolumeViewerBase* viewer) {
+        const auto& params = viewer->compositeRenderSettings().params;
+        if (_volumetricAzimuth) {
+            QSignalBlocker blocker(_volumetricAzimuth);
+            _volumetricAzimuth->setValue(params.camAzimuthDeg);
+        }
+        if (_volumetricTilt) {
+            QSignalBlocker blocker(_volumetricTilt);
+            _volumetricTilt->setValue(params.camTiltDeg);
+        }
+        if (_volumetricPerspective) {
+            QSignalBlocker blocker(_volumetricPerspective);
+            _volumetricPerspective->setValue(int(std::lround(params.camPerspective * 100.0f)));
+            if (_volumetricPerspectiveValue) {
+                _volumetricPerspectiveValue->setText(
+                    QString::number(params.camPerspective, 'f', 2));
+            }
+        }
+    });
 }
 
 void ViewerCompositePanel::applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply)

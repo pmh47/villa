@@ -6,9 +6,12 @@
 
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QLabel;
 class QScrollArea;
+class QSlider;
 class QSpinBox;
+class QVBoxLayout;
 class ViewerManager;
 class VolumeViewerBase;
 
@@ -52,13 +55,25 @@ public:
 
 private:
     void setupControls();
+    void setupVolumetricControls(QVBoxLayout* layout);
     void initializeExistingViewers();
     void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
     void updateCompositeParamsVisibility();
+    void syncVolumetricCameraFromViewer();
     void applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply);
     void applyToAllViewers(const std::function<void(VolumeViewerBase*)>& apply);
     void applyToPlaneViewers(const std::function<void(VolumeViewerBase*)>& apply);
 
     UiRefs _uiRefs;
     ViewerManager* _viewerManager{nullptr};
+
+    // Volumetric-mode controls (built programmatically; the .ui file only
+    // carries the shared composite rows).
+    QWidget* _volumetricGroup{nullptr};
+    QDoubleSpinBox* _volumetricGamma{nullptr};
+    QDoubleSpinBox* _volumetricWScale{nullptr};
+    QSlider* _volumetricPerspective{nullptr};
+    QLabel* _volumetricPerspectiveValue{nullptr};
+    QDoubleSpinBox* _volumetricAzimuth{nullptr};
+    QDoubleSpinBox* _volumetricTilt{nullptr};
 };

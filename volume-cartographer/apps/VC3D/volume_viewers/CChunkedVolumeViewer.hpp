@@ -35,6 +35,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class CState;
+class CameraGizmoWidget;
 class QEvent;
 class QGraphicsEllipseItem;
 class QGraphicsItem;
@@ -113,7 +114,7 @@ public:
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
-    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { if (_closing) return; _compositeSettings = s; submitRender("setCompositeRenderSettings"); }
+    void setCompositeRenderSettings(const CompositeRenderSettings& s) override;
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
     bool isCompositeEnabled() const override { return _compositeSettings.enabled && !streamingCompositeUnsupported(); }
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
@@ -210,6 +211,10 @@ public:
         QObject* receiver, const std::function<void()>& callback) override {
         return connect(this, &CChunkedVolumeViewer::overlaysUpdated, receiver, callback);
     }
+    QMetaObject::Connection connectCompositeCameraChanged(
+        QObject* receiver, const std::function<void()>& callback) override {
+        return connect(this, &CChunkedVolumeViewer::compositeCameraChanged, receiver, callback);
+    }
 
     void reloadPerfSettings() override;
 
@@ -274,6 +279,9 @@ signals:
     void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
     void sharedCacheStatsChanged(const QStringList& items);
+    // Volumetric camera edited from inside the viewer (gizmo drag), so
+    // external panels can refresh their yaw/pitch/perspective readouts.
+    void compositeCameraChanged();
 
 private:
     void quiesceForClose();
@@ -355,6 +363,17 @@ private:
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
+    // Sync the volumetric camera gizmo's visibility/state with the current
+    // composite settings and surface type.
+    void updateCameraGizmo();
+    // True when the volumetric composite is what renderFrame will draw for
+    // the current surface (enabled + method volumetric + non-plane surface).
+    bool volumetricCameraActive() const;
+    // Screen-direction -> surface-UV-direction mapping of the volumetric
+    // camera at w = 0 (identity when the mode is inactive):
+    // M = Rz(-azimuth) * diag(1, 1/cos(tilt)). Pan/zoom deltas arrive in
+    // screen space and must cross this to move the UV view center correctly.
+    cv::Matx22f volumetricScreenToSurface() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void refreshCursorPositionAt(const QPointF& scenePos);
     void updateCursorCrosshair(const QPointF& scenePos);
@@ -378,6 +397,7 @@ private:
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
+    CameraGizmoWidget* _cameraGizmo = nullptr;
     // No per-viewer timers. ViewerManager's global clock only services
     // intersection/status maintenance; render requests submit immediately.
     bool _closing = false;

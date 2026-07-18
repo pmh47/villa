@@ -1,6 +1,8 @@
 #include "CChunkedVolumeViewer.hpp"
 
 #include "CState.hpp"
+#include "CameraGizmoWidget.hpp"
+#include "VolumetricCompositor.hpp"
 #include "elements/ViewerStatsBar.hpp"
 #include "RemoteVolumeCachePaths.hpp"
 #include "VCSettings.hpp"
@@ -128,7 +130,8 @@ struct IntersectionStyleHash {
 
 bool isSupportedStreamingCompositeMethod(const std::string& method)
 {
-    return method == "mean" || method == "max" || method == "min" || method == "alpha";
+    return method == "mean" || method == "max" || method == "min" ||
+           method == "alpha" || method == "volumetric";
 }
 
 int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
@@ -687,6 +690,20 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
     _statsBar = new ViewerStatsBar(this);
     _statsBar->move(10, 5);
+
+    _cameraGizmo = new CameraGizmoWidget(_view);
+    _cameraGizmo->hide();
+    connect(_cameraGizmo, &CameraGizmoWidget::cameraChanged, this,
+            [this](float azimuthDeg, float tiltDeg, float perspective) {
+                if (_closing)
+                    return;
+                _compositeSettings.params.camAzimuthDeg = azimuthDeg;
+                _compositeSettings.params.camTiltDeg = tiltDeg;
+                _compositeSettings.params.camPerspective = perspective;
+                updateStatusLabel();
+                emit compositeCameraChanged();
+                submitRender("volumetric camera");
+            });
 }
 
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
@@ -1374,6 +1391,48 @@ bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
     return !isSupportedStreamingCompositeMethod(_compositeSettings.params.method);
 }
 
+void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSettings& s)
+{
+    if (_closing)
+        return;
+    _compositeSettings = s;
+    updateCameraGizmo();
+    submitRender("setCompositeRenderSettings");
+}
+
+bool CChunkedVolumeViewer::volumetricCameraActive() const
+{
+    auto surf = _surfWeak.lock();
+    return _compositeSettings.enabled &&
+           _compositeSettings.params.method == "volumetric" &&
+           surf && dynamic_cast<PlaneSurface*>(surf.get()) == nullptr;
+}
+
+cv::Matx22f CChunkedVolumeViewer::volumetricScreenToSurface() const
+{
+    if (!volumetricCameraActive())
+        return cv::Matx22f::eye();
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    const float az = _compositeSettings.params.camAzimuthDeg * kDegToRad;
+    const float tilt = std::clamp(_compositeSettings.params.camTiltDeg, 0.0f, 85.0f) * kDegToRad;
+    const float ca = std::cos(az), sa = std::sin(az);
+    const float invCt = 1.0f / std::cos(tilt);
+    // Rz(-az) * diag(1, 1/cos(tilt)) — the w=0 row of the render's
+    // screen->slab projection (see VolumetricCompositor::slabProjection).
+    return {ca, sa * invCt,
+            -sa, ca * invCt};
+}
+
+void CChunkedVolumeViewer::updateCameraGizmo()
+{
+    if (!_cameraGizmo)
+        return;
+    _cameraGizmo->setCamera(_compositeSettings.params.camAzimuthDeg,
+                            _compositeSettings.params.camTiltDeg,
+                            _compositeSettings.params.camPerspective);
+    _cameraGizmo->setVisible(volumetricCameraActive());
+}
+
 struct CChunkedVolumeViewer::RenderContext {
     PendingRenderJob renderJob;
     std::uint64_t serial = 0;
@@ -1415,6 +1474,9 @@ struct CChunkedVolumeViewer::RenderResult {
     // same-geometry render can fill chunk holes from this frame.
     cv::Mat_<uint8_t> values;
     cv::Mat_<uint8_t> coverage;
+    // Volumetric composite output (already colormapped, RGB channel order).
+    // Non-empty only for the "volumetric" method; carried forward like values.
+    cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
     float surfacePtrX = 0.0f;
@@ -1473,6 +1535,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
 
     cv::Mat_<uint8_t> values(ctx.fbH, ctx.fbW, uint8_t(0));
     cv::Mat_<uint8_t> coverage(ctx.fbH, ctx.fbW, uint8_t(0));
+    cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
     const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
@@ -1480,6 +1543,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     auto streamingCompositeUnsupported = [&]() {
         return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method);
     };
+    const bool volumetricMethod = ctx.compositeSettings.params.method == "volumetric";
 
     auto samplePlane = [&](const cv::Vec3f& origin,
                            const cv::Vec3f& vxStep,
@@ -1488,7 +1552,10 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                            cv::Mat_<uint8_t>& dst,
                            cv::Mat_<uint8_t>& cov,
                            vc::render::ChunkCache& array) {
-        const bool wantComposite = ctx.compositeSettings.planeEnabled && !streamingCompositeUnsupported();
+        // Plane views don't get the volumetric mode: fall back to single-slice.
+        const bool wantComposite = ctx.compositeSettings.planeEnabled &&
+                                   !streamingCompositeUnsupported() &&
+                                   !volumetricMethod;
         if (!wantComposite) {
             vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
@@ -1537,23 +1604,19 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
     };
 
-    auto sampleCoordsComposite = [&](const cv::Mat_<cv::Vec3f>& coords,
-                                     const cv::Mat_<cv::Vec3f>& normals,
-                                     cv::Mat_<uint8_t>& dst,
-                                     cv::Mat_<uint8_t>& cov,
-                                     vc::render::ChunkCache& array,
-                                     int startLevel,
-                                     int layersFront,
-                                     int layersBehind,
-                                     float zStep,
-                                     const CompositeParams& params) {
-        const int front = std::max(0, layersFront);
-        const int behind = std::max(0, layersBehind);
-        const int numLayers = front + behind + 1;
-        const int zStart = -behind;
+    // Sample the slab layer stack: layer i sits at offset (zStart + i) * zStep
+    // along the per-pixel surface normal. Shared by the scalar composite
+    // methods and the volumetric mode.
+    auto generateLayerStack = [&](const cv::Mat_<cv::Vec3f>& coords,
+                                  const cv::Mat_<cv::Vec3f>& normals,
+                                  vc::render::ChunkCache& array,
+                                  int startLevel,
+                                  int numLayers,
+                                  int zStart,
+                                  float zStep,
+                                  std::vector<cv::Mat_<uint8_t>>& layerValues,
+                                  std::vector<cv::Mat_<uint8_t>>& layerCoverage) {
         const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
-        std::vector<cv::Mat_<uint8_t>> layerValues;
-        std::vector<cv::Mat_<uint8_t>> layerCoverage;
         cv::Mat_<cv::Vec3f> layerCoords(coords.rows, coords.cols);
         layerValues.reserve(numLayers);
         layerCoverage.reserve(numLayers);
@@ -1570,12 +1633,32 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                         dstRow[x] = src[x] + nrow[x] * offset;
                 }
             }
-            layerValues.emplace_back(dst.rows, dst.cols, uint8_t(0));
-            layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
+            layerValues.emplace_back(coords.rows, coords.cols, uint8_t(0));
+            layerCoverage.emplace_back(coords.rows, coords.cols, uint8_t(0));
             vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                 array, startLevel, layerCoords,
                 layerValues.back(), layerCoverage.back(), compositeOptions);
         }
+    };
+
+    auto sampleCoordsComposite = [&](const cv::Mat_<cv::Vec3f>& coords,
+                                     const cv::Mat_<cv::Vec3f>& normals,
+                                     cv::Mat_<uint8_t>& dst,
+                                     cv::Mat_<uint8_t>& cov,
+                                     vc::render::ChunkCache& array,
+                                     int startLevel,
+                                     int layersFront,
+                                     int layersBehind,
+                                     float zStep,
+                                     const CompositeParams& params) {
+        const int front = std::max(0, layersFront);
+        const int behind = std::max(0, layersBehind);
+        const int numLayers = front + behind + 1;
+        const int zStart = -behind;
+        std::vector<cv::Mat_<uint8_t>> layerValues;
+        std::vector<cv::Mat_<uint8_t>> layerCoverage;
+        generateLayerStack(coords, normals, array, startLevel,
+                           numLayers, zStart, zStep, layerValues, layerCoverage);
         LayerStack stack;
         stack.values.resize(numLayers);
         for (int y = 0; y < dst.rows; ++y) {
@@ -1600,6 +1683,51 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
     };
 
+    // Volumetric mode: same layer stack as the scalar composite, but composited
+    // front-to-back along tilted view rays with a transfer function. Output is
+    // an already-colormapped RGB buffer; the blit skips the scalar LUT for it.
+    auto sampleCoordsVolumetric = [&](const cv::Mat_<cv::Vec3f>& coords,
+                                      const cv::Mat_<cv::Vec3f>& normals,
+                                      cv::Mat_<cv::Vec3b>& colorDst,
+                                      cv::Mat_<uint8_t>& cov,
+                                      vc::render::ChunkCache& array) {
+        const auto& cs = ctx.compositeSettings;
+        const int front = std::max(0, cs.layersFront);
+        const int behind = std::max(0, cs.layersBehind);
+        const int numLayers = front + behind + 1;
+        const int zStart = -behind;
+        const float zStep = cs.reverseDirection ? -1.0f : 1.0f;
+        std::vector<cv::Mat_<uint8_t>> layerValues;
+        std::vector<cv::Mat_<uint8_t>> layerCoverage;
+        generateLayerStack(coords, normals, array, ctx.startLevel,
+                           numLayers, zStart, zStep, layerValues, layerCoverage);
+
+        vc3d::volumetric::CameraParams cam;
+        cam.azimuthDeg = cs.params.camAzimuthDeg;
+        cam.tiltDeg = cs.params.camTiltDeg;
+        cam.perspective = cs.params.camPerspective;
+
+        std::array<uint32_t, 256> colorLut{};
+        vc::buildWindowLevelColormapLut(colorLut, ctx.windowLow, ctx.windowHigh,
+                                        ctx.baseColormapId);
+        // Ray-segment length correction 1/|d_w| so tilted views don't look
+        // artificially transparent (per-frame constant: parallel rays).
+        const auto dir = vc3d::volumetric::viewDirection(cam);
+        const float segLen = 1.0f / std::max(dir[2], 1e-3f);
+        const auto opacityLut = vc3d::volumetric::buildOpacityLut(
+            cs.params.alphaMin, cs.params.alphaMax, cs.params.alphaOpacity,
+            cs.params.tfGamma, cs.params.isoCutoff, segLen);
+
+        // W scaling exaggerates the relief: the layer planes spread apart
+        // along the normal before the rotated render (the in-plane content
+        // and the sampling itself are untouched).
+        const float wScale = std::max(cs.params.wScale, 0.01f);
+        vc3d::volumetric::compositeVolumetric(layerValues, layerCoverage, cam,
+                                              zStart, ctx.scale * wScale,
+                                              colorLut, opacityLut,
+                                              colorDst, cov);
+    };
+
     auto sampleCoords = [&](const cv::Mat_<cv::Vec3f>& coords,
                             const cv::Mat_<cv::Vec3f>& normals,
                             cv::Mat_<uint8_t>& dst,
@@ -1611,6 +1739,10 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         if (!wantComposite) {
             vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                 array, ctx.startLevel, coords, dst, cov, options);
+            return;
+        }
+        if (volumetricMethod) {
+            sampleCoordsVolumetric(coords, normals, colorValues, cov, array);
             return;
         }
 
@@ -1770,12 +1902,37 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 }
             }
         };
-        fillFromPrev(values, coverage, prev->values, prev->coverage);
+        auto fillFromPrevColor = [](cv::Mat_<cv::Vec3b>& dst, cv::Mat_<uint8_t>& cov,
+                                    const cv::Mat_<cv::Vec3b>& prevDst,
+                                    const cv::Mat_<uint8_t>& prevCov) {
+            if (dst.empty() || prevDst.empty() ||
+                dst.size() != prevDst.size() || cov.size() != prevCov.size())
+                return;
+            for (int y = 0; y < dst.rows; ++y) {
+                auto* dstRow = dst.ptr<cv::Vec3b>(y);
+                uint8_t* covRow = cov.ptr<uint8_t>(y);
+                const auto* prevDstRow = prevDst.ptr<cv::Vec3b>(y);
+                const uint8_t* prevCovRow = prevCov.ptr<uint8_t>(y);
+                for (int x = 0; x < dst.cols; ++x) {
+                    if (!covRow[x] && prevCovRow[x]) {
+                        dstRow[x] = prevDstRow[x];
+                        covRow[x] = 1;
+                    }
+                }
+            }
+        };
+        // Same geometry implies the same composite method (compositeSettings
+        // compares ==), so exactly one of these applies per frame.
+        if (!colorValues.empty())
+            fillFromPrevColor(colorValues, coverage, prev->colorValues, prev->coverage);
+        else
+            fillFromPrev(values, coverage, prev->values, prev->coverage);
         fillFromPrev(overlayValues, overlayCoverage,
                      prev->overlayValues, prev->overlayCoverage);
     }
     result.values = values;
     result.coverage = coverage;
+    result.colorValues = colorValues;
     result.overlayValues = overlayValues;
     result.overlayCoverage = overlayCoverage;
 
@@ -1792,14 +1949,23 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     auto* fbBits = reinterpret_cast<uint32_t*>(result.framebuffer.bits());
     const int fbStride = result.framebuffer.bytesPerLine() / 4;
     const uint32_t uncoveredPixel = planeView ? 0xFF404040u : 0xFF000000u;
+    // The volumetric composite is already colormapped: blit its RGB buffer
+    // straight into the framebuffer, skipping the scalar LUT stage. Overlay
+    // blending on top is unchanged.
+    const bool hasColorValues = !colorValues.empty();
     for (int y = 0; y < ctx.fbH; ++y) {
         auto* row = fbBits + size_t(y) * size_t(fbStride);
         const auto* src = values.ptr<uint8_t>(y);
         const auto* cov = coverage.ptr<uint8_t>(y);
+        const auto* colorSrc = hasColorValues ? colorValues.ptr<cv::Vec3b>(y) : nullptr;
         const auto* overlaySrc = hasOverlay ? overlayValues.ptr<uint8_t>(y) : nullptr;
         const auto* overlayCov = hasOverlay ? overlayCoverage.ptr<uint8_t>(y) : nullptr;
         for (int x = 0; x < ctx.fbW; ++x) {
-            uint32_t pixel = cov[x] ? lut[src[x]] : uncoveredPixel;
+            uint32_t pixel = !cov[x] ? uncoveredPixel
+                : hasColorValues
+                    ? (0xFF000000u | (uint32_t(colorSrc[x][0]) << 16) |
+                       (uint32_t(colorSrc[x][1]) << 8) | uint32_t(colorSrc[x][2]))
+                    : lut[src[x]];
             if (hasOverlay && overlayCov[x] &&
                 overlaySrc[x] >= ctx.overlayWindowLow && overlaySrc[x] <= ctx.overlayWindowHigh) {
                 pixel = alphaBlendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
@@ -1919,14 +2085,16 @@ void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
     const qreal currentHalfH = static_cast<qreal>(_framebuffer.height()) * 0.5;
     const qreal renderedHalfW = static_cast<qreal>(job.fbW) * 0.5;
     const qreal renderedHalfH = static_cast<qreal>(job.fbH) * 0.5;
+    // The view-center delta lives in surface UV; the stale framebuffer slides
+    // in screen space, so convert it back through the inverse camera mapping
+    // (identity outside the volumetric mode).
+    const cv::Vec2f surfDelta(job.surfacePtrX - _surfacePtrX,
+                              job.surfacePtrY - _surfacePtrY);
+    const cv::Vec2f screenDelta = volumetricScreenToSurface().inv() * surfDelta;
     const QPointF offset(
-        currentHalfW +
-            (static_cast<qreal>(job.surfacePtrX) - static_cast<qreal>(_surfacePtrX)) *
-                static_cast<qreal>(_scale) -
+        currentHalfW + static_cast<qreal>(screenDelta[0]) * static_cast<qreal>(_scale) -
             renderedHalfW * ratio,
-        currentHalfH +
-            (static_cast<qreal>(job.surfacePtrY) - static_cast<qreal>(_surfacePtrY)) *
-                static_cast<qreal>(_scale) -
+        currentHalfH + static_cast<qreal>(screenDelta[1]) * static_cast<qreal>(_scale) -
             renderedHalfH * ratio);
     _view->setDirectFramebufferMapping(ratio, offset);
 }
@@ -2302,8 +2470,13 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
 {
     markInteractiveMotion(std::hypot(double(dx), double(dy)));
     const float invScale = _panSensitivity / _scale;
-    _surfacePtrX -= dx * invScale;
-    _surfacePtrY -= dy * invScale;
+    // Pan deltas are screen-space; under the volumetric camera the UV view
+    // center must move along the (rotated/foreshortened) screen directions.
+    const cv::Matx22f m = volumetricScreenToSurface();
+    const float sx = dx * invScale;
+    const float sy = dy * invScale;
+    _surfacePtrX -= m(0, 0) * sx + m(0, 1) * sy;
+    _surfacePtrY -= m(1, 0) * sx + m(1, 1) * sy;
     if (_contentMaxU > _contentMinU) {
         _surfacePtrX = std::clamp(_surfacePtrX, _contentMinU, _contentMaxU);
         _surfacePtrY = std::clamp(_surfacePtrY, _contentMinV, _contentMaxV);
@@ -2333,8 +2506,11 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     if (mx >= 0 && mx < vpW && my >= 0 && my < vpH) {
         const float dx = mx - vpW * 0.5f;
         const float dy = my - vpH * 0.5f;
-        _surfacePtrX += dx * (1.0f / _scale - 1.0f / newScale);
-        _surfacePtrY += dy * (1.0f / _scale - 1.0f / newScale);
+        const float shift = 1.0f / _scale - 1.0f / newScale;
+        // The zoom anchor offset is screen-space too (see panByF).
+        const cv::Matx22f m = volumetricScreenToSurface();
+        _surfacePtrX += (m(0, 0) * dx + m(0, 1) * dy) * shift;
+        _surfacePtrY += (m(1, 0) * dx + m(1, 1) * dy) * shift;
     }
     _scale = newScale;
     recalcPyramidLevel();
@@ -4967,6 +5143,10 @@ const std::map<std::string, cv::Vec3b>& CChunkedVolumeViewer::surfaceOverlays() 
 
 void CChunkedVolumeViewer::updateStatusLabel()
 {
+    // Piggyback on the status refresh: it runs on every surface/settings
+    // change, which is exactly when the gizmo's visibility can change.
+    updateCameraGizmo();
+
     if (!_statsBar)
         return;
 
@@ -4980,6 +5160,16 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
         items << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
+    } else if (_compositeSettings.enabled &&
+               _compositeSettings.params.method == "volumetric") {
+        QString volumetric = QString("composite volumetric az %1 tilt %2")
+                                 .arg(_compositeSettings.params.camAzimuthDeg, 0, 'f', 0)
+                                 .arg(_compositeSettings.params.camTiltDeg, 0, 'f', 0);
+        if (_compositeSettings.params.camPerspective > 0.0f)
+            volumetric += QString(" persp %1").arg(_compositeSettings.params.camPerspective, 0, 'f', 2);
+        if (_compositeSettings.params.wScale != 1.0f)
+            volumetric += QString(" w×%1").arg(_compositeSettings.params.wScale, 0, 'f', 1);
+        items << volumetric;
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
         items << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
     }
