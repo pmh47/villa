@@ -1371,10 +1371,7 @@ void CChunkedVolumeViewer::markInteractiveMotion(double)
 
 bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
 {
-    return !isSupportedStreamingCompositeMethod(_compositeSettings.params.method) ||
-           _compositeSettings.params.lightingEnabled ||
-           _compositeSettings.params.method == "beerLambert" ||
-           _compositeSettings.useVolumeGradients;
+    return !isSupportedStreamingCompositeMethod(_compositeSettings.params.method);
 }
 
 struct CChunkedVolumeViewer::RenderContext {
@@ -1481,10 +1478,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
 
     auto streamingCompositeUnsupported = [&]() {
-        return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method) ||
-               ctx.compositeSettings.params.lightingEnabled ||
-               ctx.compositeSettings.params.method == "beerLambert" ||
-               ctx.compositeSettings.useVolumeGradients;
+        return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method);
     };
 
     auto samplePlane = [&](const cv::Vec3f& origin,
