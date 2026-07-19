@@ -1013,6 +1013,35 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                   static_cast<qreal>(_framebuffer.height()) * 0.5);
         preservedViewCenter = cursorVolumePosition(sceneCenter);
     }
+    if (auto* newPlane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        // Plane rotated in place (azimuth folding / up realignment): keep the
+        // world view center fixed so the view spins about the screen center,
+        // not the plane origin. Origin or normal changes (slice scroll, focus
+        // move, tilt) keep the existing follow-the-plane behavior. Applied
+        // directly because these updates arrive as edit updates, which return
+        // early below.
+        if (_planeFrame.valid &&
+            cv::norm(_planeFrame.origin - newPlane->origin()) < 1e-3 &&
+            _planeFrame.normal.dot(newPlane->normal({0, 0, 0})) > 1.0f - 1e-6f &&
+            (cv::norm(_planeFrame.vx - newPlane->basisX()) > 1e-6 ||
+             cv::norm(_planeFrame.vy - newPlane->basisY()) > 1e-6)) {
+            const cv::Vec3f center = _planeFrame.origin +
+                                     _planeFrame.vx * _surfacePtrX +
+                                     _planeFrame.vy * _surfacePtrY;
+            const cv::Vec3f projected = newPlane->project(center, 1.0, 1.0);
+            if (std::isfinite(projected[0]) && std::isfinite(projected[1])) {
+                _surfacePtrX = projected[0];
+                _surfacePtrY = projected[1];
+            }
+        }
+        _planeFrame.valid = true;
+        _planeFrame.origin = newPlane->origin();
+        _planeFrame.normal = newPlane->normal({0, 0, 0});
+        _planeFrame.vx = newPlane->basisX();
+        _planeFrame.vy = newPlane->basisY();
+    } else {
+        _planeFrame.valid = false;
+    }
 
     _surfWeak = surf;
     if (isSameCurrentSurface && isEditUpdate) {
@@ -1395,8 +1424,20 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
 {
     if (_closing)
         return;
+    // The slice-plane owner folds this view's azimuth into the plane itself,
+    // so it must hear about anything that changes the effective camera —
+    // including method/enable flips that implicitly zero it.
+    const bool cameraChanged =
+        _compositeSettings.params.camAzimuthDeg != s.params.camAzimuthDeg ||
+        _compositeSettings.params.camTiltDeg != s.params.camTiltDeg ||
+        _compositeSettings.params.camPerspective != s.params.camPerspective ||
+        _compositeSettings.params.method != s.params.method ||
+        _compositeSettings.planeEnabled != s.planeEnabled ||
+        _compositeSettings.enabled != s.enabled;
     _compositeSettings = s;
     updateCameraGizmo();
+    if (cameraChanged)
+        emit compositeCameraChanged();
     submitRender("setCompositeRenderSettings");
 }
 
@@ -1412,12 +1453,21 @@ bool CChunkedVolumeViewer::volumetricCameraActive() const
                : _compositeSettings.enabled;
 }
 
+float CChunkedVolumeViewer::volumetricEffectiveAzimuthDeg() const
+{
+    // Axis-aligned slice views fold the azimuth spin into the plane's basis
+    // (AxisAlignedSliceController), so their screen x axis is +u already.
+    if (_volumetricAzimuthInSurface)
+        return 0.0f;
+    return _compositeSettings.params.camAzimuthDeg;
+}
+
 cv::Matx22f CChunkedVolumeViewer::volumetricScreenToSurface() const
 {
     if (!volumetricCameraActive())
         return cv::Matx22f::eye();
     constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-    const float az = _compositeSettings.params.camAzimuthDeg * kDegToRad;
+    const float az = volumetricEffectiveAzimuthDeg() * kDegToRad;
     const float tilt = std::clamp(_compositeSettings.params.camTiltDeg, 0.0f, 85.0f) * kDegToRad;
     const float ca = std::cos(az), sa = std::sin(az);
     const float invCt = 1.0f / std::cos(tilt);
@@ -1425,6 +1475,67 @@ cv::Matx22f CChunkedVolumeViewer::volumetricScreenToSurface() const
     // screen->slab projection (see VolumetricCompositor::slabProjection).
     return {ca, sa * invCt,
             -sa, ca * invCt};
+}
+
+namespace {
+
+struct VolumetricW0Map {
+    float ca = 1.0f, sa = 0.0f;  // azimuth rotation
+    float ct = 1.0f;             // cos(tilt)
+    float k = 0.0f;              // sin(tilt) / camera distance; 0 = ortho
+};
+
+VolumetricW0Map volumetricW0Map(const CompositeRenderSettings& cs,
+                                float azimuthDeg,
+                                int fbW,
+                                int fbH)
+{
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    VolumetricW0Map m;
+    const float az = azimuthDeg * kDegToRad;
+    const float tilt = std::clamp(cs.params.camTiltDeg, 0.0f, 85.0f) * kDegToRad;
+    m.ca = std::cos(az);
+    m.sa = std::sin(az);
+    m.ct = std::cos(tilt);
+    const float p = cs.params.camPerspective;
+    if (p > 0.0f) {
+        // Camera distance matching VolumetricCompositor::perspectiveCamera:
+        // magnification 1 at the view center.
+        const float halfSpan = 0.5f * std::max(float(std::max(fbW, fbH)), 1.0f);
+        const float dist = halfSpan / std::tan(std::clamp(p, 0.01f, 1.0f) * 45.0f * kDegToRad);
+        m.k = std::sin(tilt) / dist;
+    }
+    return m;
+}
+
+} // namespace
+
+cv::Vec2f CChunkedVolumeViewer::volumetricScreenPxToSurfacePx(const cv::Vec2f& s) const
+{
+    if (!volumetricCameraActive())
+        return s;
+    const auto m = volumetricW0Map(_compositeSettings, volumetricEffectiveAzimuthDeg(),
+                                   _framebuffer.width(), _framebuffer.height());
+    // Ray through the screen point hits the w=0 plane at Rz(-az)*H0*s, with H0
+    // the tilt-about-screen-x plane homography (ortho limit: diag(1, 1/ct)).
+    // Points past the horizon clamp to far-but-finite same-sign coords.
+    const float denom = std::max(m.ct + m.k * s[1], 1e-4f);
+    const float u0 = m.ct * s[0] / denom;
+    const float v0 = s[1] / denom;
+    return {m.ca * u0 + m.sa * v0, -m.sa * u0 + m.ca * v0};
+}
+
+cv::Vec2f CChunkedVolumeViewer::volumetricSurfacePxToScreenPx(const cv::Vec2f& q) const
+{
+    if (!volumetricCameraActive())
+        return q;
+    const auto m = volumetricW0Map(_compositeSettings, volumetricEffectiveAzimuthDeg(),
+                                   _framebuffer.width(), _framebuffer.height());
+    const float u0 = m.ca * q[0] - m.sa * q[1];
+    const float v0 = m.sa * q[0] + m.ca * q[1];
+    const float sy = v0 * m.ct / std::max(1.0f - m.k * v0, 1e-4f);
+    const float sx = u0 * (m.ct + m.k * sy) / m.ct;
+    return {sx, sy};
 }
 
 void CChunkedVolumeViewer::updateCameraGizmo()
@@ -2035,6 +2146,10 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlayStartLevel = overlayRenderStartLevel(preferSurfaceResolution);
     job.samplingMethod = _samplingMethod;
     job.compositeSettings = _compositeSettings;
+    // Slice views carry the azimuth in the plane basis itself; the volumetric
+    // compositor must not apply it a second time.
+    if (_volumetricAzimuthInSurface)
+        job.compositeSettings.params.camAzimuthDeg = 0.0f;
     job.windowLow = _windowLow;
     job.windowHigh = _windowHigh;
     job.baseColormapId = _baseColormapId;
@@ -3230,9 +3345,9 @@ QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
 {
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    const qreal vx = (surfX - _surfacePtrX) * _scale + vpCx;
-    const qreal vy = (surfY - _surfacePtrY) * _scale + vpCy;
-    return QPointF(vx, vy);
+    const cv::Vec2f s = volumetricSurfacePxToScreenPx(
+        {(surfX - _surfacePtrX) * _scale, (surfY - _surfacePtrY) * _scale});
+    return QPointF(s[0] + vpCx, s[1] + vpCy);
 }
 
 cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
@@ -3241,17 +3356,29 @@ cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
         return {0, 0};
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    return {(static_cast<float>(scenePos.x()) - vpCx) / _scale + _surfacePtrX,
-            (static_cast<float>(scenePos.y()) - vpCy) / _scale + _surfacePtrY};
+    const cv::Vec2f q = volumetricScreenPxToSurfacePx(
+        {static_cast<float>(scenePos.x()) - vpCx,
+         static_cast<float>(scenePos.y()) - vpCy});
+    return {q[0] / _scale + _surfacePtrX, q[1] / _scale + _surfacePtrY};
 }
 
 QRectF CChunkedVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const
 {
-    const QPointF a = surfaceToScene(static_cast<float>(surfRect.left()),
-                                     static_cast<float>(surfRect.top()));
-    const QPointF b = surfaceToScene(static_cast<float>(surfRect.right()),
-                                     static_cast<float>(surfRect.bottom()));
-    return QRectF(a, b).normalized();
+    // Bounding box of all four mapped corners: under the volumetric camera
+    // the mapping can rotate, so two corners are not enough.
+    const QPointF pts[4] = {
+        surfaceToScene(static_cast<float>(surfRect.left()), static_cast<float>(surfRect.top())),
+        surfaceToScene(static_cast<float>(surfRect.right()), static_cast<float>(surfRect.top())),
+        surfaceToScene(static_cast<float>(surfRect.right()), static_cast<float>(surfRect.bottom())),
+        surfaceToScene(static_cast<float>(surfRect.left()), static_cast<float>(surfRect.bottom()))};
+    QRectF out(pts[0], pts[0]);
+    for (int i = 1; i < 4; ++i) {
+        out.setLeft(std::min(out.left(), pts[i].x()));
+        out.setTop(std::min(out.top(), pts[i].y()));
+        out.setRight(std::max(out.right(), pts[i].x()));
+        out.setBottom(std::max(out.bottom(), pts[i].y()));
+    }
+    return out;
 }
 
 cv::Vec2f CChunkedVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) const

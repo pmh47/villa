@@ -25,8 +25,9 @@ ortho ↔ perspective preserves the central ray and the coverage at that anchor 
 (perspective then magnifies nearer layers and shrinks farther ones). A `wScale` relief
 exaggeration factor stretches the slab along the normal before the render. Consequence: at
 nonzero tilt the w=0 plane is no longer pixel-identical to the untilted view (content
-compresses by cos(tilt) across the tilt axis), so scene overlays only align exactly at zero
-tilt.
+compresses by cos(tilt) across the tilt axis). Scene overlays follow this exactly at w=0:
+the viewer's screen↔surface funnel applies the camera's w=0 plane homography (see the
+slice-view geometry note below), so overlays only misalign for content off the w=0 plane.
 
 Extension (2026-07): the mode also works in the plane (slice) views, contrary to the
 original flattened-view-only scope below. The slice slab is the same layer stack the plane
@@ -39,6 +40,24 @@ flattened view only, while each slice view's camera is edited via its own gizmo
 (double-click a pane to reset it). The transfer-function params (alpha window, opacity,
 gamma) stay shared across viewers. `wScale` stays flattened-view-only — a slice slab has
 no surface relief to exaggerate.
+
+Slice-view geometry (2026-07 follow-up): a slice view's **azimuth is not applied by the
+compositor at all** — it is folded into the slice plane's own basis
+(`AxisAlignedSliceController` adds a handedness-corrected in-plane rotation on top of the
+up-alignment; `CChunkedVolumeViewer::_volumetricAzimuthInSurface` zeroes the azimuth in
+the render job). This keeps the sampled ROI matched to the viewport at any azimuth (no
+rotated-strip coverage loss) and, because every plane-derived consumer (patch–slice
+intersections, focus point, other-plane handles, scene↔volume mapping) reads the plane
+object, they all agree with the rendered view for free. The plane spins about the world
+view center (the viewer re-projects its pointer when its plane rotates in place). The
+remaining tilt/perspective camera is exact for content **on** the slice plane: the w=0
+screen↔surface map is a plane homography (ortho: y-foreshorten by cos tilt; perspective:
+pinhole view of a plane), and `surfaceToScene`/`sceneToSurface` — the single funnel all
+overlays and mouse paths go through — apply it, so on-plane overlays align exactly at any
+tilt. Off-plane content still has no single correct screen position under a slab render;
+it draws at its plane-projected (w=0) position as before. The flattened view keeps
+compositor-side azimuth; its overlay funnel uses the same homography, so its overlays now
+align at w=0 too.
 
 ## Goal
 

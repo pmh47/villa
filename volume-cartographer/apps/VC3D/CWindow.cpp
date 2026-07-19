@@ -4213,6 +4213,20 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     }
 
     const std::string& surfName = viewer->surfName();
+    if ((surfName == "xy plane" || surfName == "seg xz" || surfName == "seg yz") &&
+        !viewer->property("vc_volcam_bound").toBool()) {
+        // Slice views fold their volumetric-camera azimuth into the slice
+        // plane itself (so sampling, intersections, focus and handles all
+        // agree); reconfigure the planes whenever the per-view camera (or
+        // anything that implicitly zeroes it) changes.
+        viewer->setVolumetricAzimuthInSurface(true);
+        connect(viewer, &CChunkedVolumeViewer::compositeCameraChanged, this, [this]() {
+            if (_axisAlignedSliceController) {
+                _axisAlignedSliceController->syncVolumetricAzimuths();
+            }
+        });
+        viewer->setProperty("vc_volcam_bound", true);
+    }
     if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
         if (auto* graphicsView = viewer->graphicsView()) {
             graphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
@@ -11043,16 +11057,24 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         planeShared->setNormal(normal);
         planeShared->setInPlaneRotation(0.0f);
 
+        // Keep the volumetric-camera azimuth folded into the plane (see
+        // AxisAlignedSliceController::applyOrientation).
+        float inPlaneRot = AxisAlignedSliceController::azimuthInPlaneRotation(
+            *planeShared,
+            _axisAlignedSliceController
+                ? _axisAlignedSliceController->volumetricAzimuthDeg(planeName)
+                : 0.0f);
+
         // Adjust in-plane rotation so Z projects "up"
         const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
         const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, normal);
         const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
         if (cv::norm(desiredUp) > kEpsilon) {
             const cv::Vec3f currentUp = planeShared->basisY();
-            const float delta = signedAngleBetween(currentUp, desiredUp, normal);
-            if (std::abs(delta) > kEpsilon) {
-                planeShared->setInPlaneRotation(delta);
-            }
+            inPlaneRot += signedAngleBetween(currentUp, desiredUp, normal);
+        }
+        if (std::abs(inPlaneRot) > kEpsilon) {
+            planeShared->setInPlaneRotation(inPlaneRot);
         }
 
         _state->setSurface(planeName, planeShared);

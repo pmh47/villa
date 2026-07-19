@@ -116,6 +116,11 @@ public:
 
     void setCompositeRenderSettings(const CompositeRenderSettings& s) override;
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
+    // Set by CWindow for the axis-aligned slice views: their volumetric-camera
+    // azimuth is folded into the slice plane's basis by
+    // AxisAlignedSliceController, so the render/mapping paths here must treat
+    // the compositor azimuth as 0 (the gizmo still owns the value).
+    void setVolumetricAzimuthInSurface(bool on) { _volumetricAzimuthInSurface = on; }
     bool isCompositeEnabled() const override { return _compositeSettings.enabled && !streamingCompositeUnsupported(); }
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
@@ -374,6 +379,16 @@ private:
     // M = Rz(-azimuth) * diag(1, 1/cos(tilt)). Pan/zoom deltas arrive in
     // screen space and must cross this to move the UV view center correctly.
     cv::Matx22f volumetricScreenToSurface() const;
+    // Azimuth the compositor (and the w=0 screen<->surface mapping) should
+    // apply: 0 when the slice-plane owner folds it into the plane basis
+    // instead, the per-view camera azimuth otherwise.
+    float volumetricEffectiveAzimuthDeg() const;
+    // Exact w=0 screen<->surface mapping of the volumetric camera, including
+    // perspective (a plane-to-screen homography; identity when the mode is
+    // inactive). Both sides are in framebuffer pixels relative to the view
+    // center / the surface pointer.
+    cv::Vec2f volumetricScreenPxToSurfacePx(const cv::Vec2f& screenRel) const;
+    cv::Vec2f volumetricSurfacePxToScreenPx(const cv::Vec2f& surfRel) const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void refreshCursorPositionAt(const QPointF& scenePos);
     void updateCursorCrosshair(const QPointF& scenePos);
@@ -415,6 +430,20 @@ private:
     std::string _pendingRenderCaller;
     std::string _pendingIntersectionReason;
     std::string _pendingIntersectionCaller;
+
+    bool _volumetricAzimuthInSurface = false;
+    // Last-seen frame of a displayed PlaneSurface: when the plane is rotated
+    // in place (azimuth folding / up realignment) the world view center is
+    // re-projected so the view spins about the screen center instead of the
+    // plane origin.
+    struct PlaneFrameSnapshot {
+        bool valid = false;
+        cv::Vec3f origin{0, 0, 0};
+        cv::Vec3f normal{0, 0, 0};
+        cv::Vec3f vx{0, 0, 0};
+        cv::Vec3f vy{0, 0, 0};
+    };
+    PlaneFrameSnapshot _planeFrame;
 
     std::shared_ptr<Volume> _volume;
     std::weak_ptr<Surface> _surfWeak;
