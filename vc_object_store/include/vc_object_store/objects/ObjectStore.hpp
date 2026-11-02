@@ -154,6 +154,11 @@ struct SelectedRelationship {
     bool applicable = false;
 };
 
+struct RevisionReadView {
+    std::vector<ObjectRevision> objects;
+    std::vector<SelectedRelationship> relationships;
+};
+
 struct JournalEntry {
     int64_t seq = 0;
     std::string recordUuid;
@@ -401,6 +406,7 @@ public:
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
     std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
+    RevisionReadView revisionReadView(const Txn&, const RevisionSelection&) const;
     // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
     // The caller decides domain meaning.
     void retainRelationship(WriteTxn&, const std::string& edgeUuid);

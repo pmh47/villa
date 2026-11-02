@@ -79,6 +79,19 @@ try {
         auto txn = db.read();
         const auto at = db.relationshipsAt(txn, selected);
         require(at.size() == 1 && at[0].applicable, "applicable at the pinned revisions");
+        const auto view = db.revisionReadView(txn, selected);
+        require(view.objects.size() == 2 && view.relationships.size() == 1,
+                "combined view returns the same pinned objects and relationship");
+        require(view.relationships[0].applicable &&
+                view.relationships[0].relationship.uuid == at[0].relationship.uuid,
+                "combined view keeps historical relationship applicability");
+        for (const auto& object : view.objects) {
+            require(object.uuid == *selected.at(object.objectUuid), "combined view keeps selected object revision");
+            const auto pinned = db.objectRevision(txn, object.uuid);
+            require(object.geometryRevision == pinned->geometryRevision &&
+                    object.record.meta == pinned->record.meta,
+                    "combined view keeps historical geometry and metadata");
+        }
     }
     { auto txn = db.write(heads()); db.retainRelationship(txn, edge); txn.commit(); }
     require(component(a, std::nullopt, true) == std::vector<std::string>{a, b}, "retained: applicable again");

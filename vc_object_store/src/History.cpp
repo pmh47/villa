@@ -88,6 +88,10 @@ bool endpointApplies(const ObjectStore& store, const Txn& txn, const Anchor& anc
                      const ObjectRevision& selected)
 {
     if (selected.deleted || selected.record.retired) return false;
+    if (selected.uuid == pinned) {
+        if (!anchor.metadataKeys.empty() && !selected.metadataComplete) return false;
+        return !endpointChanged(store, txn, anchor, geometry, selected.geometryRevision);
+    }
     const auto original = store.objectRevision(txn, pinned);
     if (!original || (!anchor.metadataKeys.empty() && !original->metadataComplete)) return false;
     return dependencyMetadata(objectToJson(original->record), anchor) ==
@@ -533,22 +537,29 @@ std::vector<RelationshipRevision> ObjectStore::recordedRelationships(const Txn& 
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const RevisionSelection& selection) const
 {
+    return revisionReadView(txn, selection).relationships;
+}
+
+RevisionReadView ObjectStore::revisionReadView(const Txn& txn, const RevisionSelection& selection) const
+{
     DependencyScope dependencies;
     auto* db = static_cast<sqlite3*>(connection(txn));
-    std::map<std::string, ObjectRevision> revisions;
+    RevisionReadView result;
+    result.objects.reserve(selection.size());
+    std::map<std::string, size_t> revisions;
     std::map<std::string, std::map<std::string, std::string>> memberships;
     std::set<std::string> versions;
     for (const auto& [object, revision] : selection) {
         const auto uuid = formatUuid(parseUuid(object));
-        const auto value = revision ? objectRevision(txn, *revision) : currentObjectRevision(txn, uuid);
+        auto value = revision ? objectRevision(txn, *revision) : currentObjectRevision(txn, uuid);
         if (!value || value->objectUuid != uuid || value->deleted)
             throw std::invalid_argument("object history: selection revision does not belong to object");
         auto selected = members(db, value->uuid);
         for (const auto& [edge, version] : selected) versions.insert(version);
         memberships.emplace(uuid, std::move(selected));
-        revisions.emplace(uuid, *value);
+        revisions.emplace(uuid, result.objects.size());
+        result.objects.push_back(std::move(*value));
     }
-    std::vector<SelectedRelationship> result;
     for (const auto& version : versions) {
         auto edge = relationship(db, version);
         auto endpoint = [&](const std::string& object, const Anchor& anchor, const std::optional<std::string>& geometry,
@@ -558,11 +569,11 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, c
             const auto& membership = memberships.at(object);
             const auto member = membership.find(edge.record.uuid);
             return member != membership.end() && member->second == version &&
-                endpointApplies(*this, txn, anchor, geometry, pinned, found->second);
+                endpointApplies(*this, txn, anchor, geometry, pinned, result.objects[found->second]);
         };
         const bool applicable = endpoint(edge.record.aUuid, edge.record.aAnchor, edge.aGeometryRevision, edge.aRevision) &&
                                 endpoint(edge.record.bUuid, edge.record.bAnchor, edge.bGeometryRevision, edge.bRevision);
-        result.push_back({std::move(edge), applicable});
+        result.relationships.push_back({std::move(edge), applicable});
     }
     return result;
 }

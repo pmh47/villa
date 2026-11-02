@@ -80,25 +80,8 @@ auto writeMethod()
     }(Method);
 }
 
-// A revision view read natively, so the read can run without the GIL (a
-// large store's view takes seconds) and become Python objects after.
-struct RevisionView {
-    std::vector<vo::ObjectRevision> objects;
-    std::vector<vo::SelectedRelationship> relationships;
-};
-
-RevisionView readRevisionView(vo::ObjectStore& db, const vo::Txn& txn, const vo::RevisionSelection& selection)
-{
-    RevisionView view;
-    view.relationships = db.relationshipsAt(txn, selection);
-    for (const auto& [uuid, selected] : selection) {
-        auto revision = selected ? db.objectRevision(txn, *selected) : db.currentObjectRevision(txn, uuid);
-        view.objects.push_back(std::move(*revision)); // selection was validated above
-    }
-    return view;
-}
-
-nb::dict revisionViewToPy(const RevisionView& view)
+// Resolve once without the GIL; serialize the owned result after reacquiring it.
+nb::dict revisionViewToPy(const vo::RevisionReadView& view)
 {
     nb::dict result, resolved;
     nb::list objects, edges;
@@ -1095,7 +1078,7 @@ NB_MODULE(_native, m)
         }, nb::arg("selection"))
         .def("revision_read_view", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
             return revisionViewToPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return readRevisionView(db, txn, selection);
+                return db.revisionReadView(txn, selection);
             }));
         }, nb::arg("selection"),
            "Resolve selected objects, metadata, geometry references and relationship applicability in one read snapshot.")
@@ -1103,7 +1086,7 @@ NB_MODULE(_native, m)
              nb::arg("include_retired") = false)
         .def("revision_read_view_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
             return revisionViewToPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return readRevisionView(db, txn, db.revisionSelectionAt(txn, time, includeRetired));
+                return db.revisionReadView(txn, db.revisionSelectionAt(txn, time, includeRetired));
             }));
         }, nb::arg("published_at_us"), nb::arg("include_retired") = false,
            "Recover all objects, geometry references and recorded relationships at a publication time (UTC Unix microseconds).")
