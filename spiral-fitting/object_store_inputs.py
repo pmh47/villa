@@ -1302,6 +1302,26 @@ def _track_crossing_csr(snapshot, tracks, lengths, problems):
     }
 
 
+def _track_geometry(store, tracks, batch_size=4096):
+    """Read verified point arrays in bounded native batches, preserving row order."""
+    for begin in range(0, len(tracks), batch_size):
+        batch = tracks[begin:begin + batch_size]
+        try:
+            packed = store.read_geometry_arrays(
+                [obj.geometry_revision for obj in batch], 'points')
+        except (ValueError, RuntimeError):
+            # Keep the ordinary reader's diagnostics for malformed or
+            # heterogeneous arrays. Edited revisions use the store's own
+            # verified delta/shared-array fallback inside the packed API.
+            for offset, obj in enumerate(batch):
+                arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
+                yield begin + offset, obj, arrays['points']
+            continue
+        points, offsets = packed.values, packed.offsets
+        for offset, obj in enumerate(batch):
+            yield begin + offset, obj, points[offsets[offset]:offsets[offset + 1]]
+
+
 def materialize_tracks(store, snapshot, *, z_begin, z_end):
     """The snapshot's tracks and crossings (TrackInputs), or None without
     tracks; and counts.
@@ -1320,9 +1340,7 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end):
     problems = []
     lengths = np.zeros(len(tracks), dtype=np.int64)
     kept, stored, fit, families, scales = [], [], [], [], []
-    for index, obj in enumerate(tracks):
-        arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
-        xyz = arrays['points']
+    for index, obj, xyz in _track_geometry(store, tracks):
         if xyz.ndim != 2 or xyz.shape[1] != 3:
             problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
             continue
@@ -1906,9 +1924,9 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
     options = {'author': author} if refresh else {'read_only': True}
     with ObjectStore.open(path, **options) as store:
         uuids = resolve_selection(store, request)
-        snapshot = read_snapshot(store, request, uuids)
         if not refresh:
             return uuids, ['link refresh: off; reading the store\'s current relationships'], None
+        snapshot = read_snapshot(store, request, uuids)
         lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
     if problems:
         raise LinkRefreshError(problems)

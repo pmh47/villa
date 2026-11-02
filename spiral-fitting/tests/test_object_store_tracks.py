@@ -50,11 +50,15 @@ def _materialize_tracks(db, z_begin=0, z_end=64, **request):
     return osi.materialize_tracks(db, snapshot, z_begin=z_begin, z_end=z_end)
 
 
-def test_refreshed_crossings_are_the_ones_spiral_finds(db):
+@pytest.mark.parametrize('batch_size', [1, 2, 4096])
+def test_refreshed_crossings_are_the_ones_spiral_finds(db, monkeypatch, batch_size):
     """The store's track-crossing detector, run by the link refresh, gives
     the crossing CSR Spiral's own exact-crossing builder finds on the same
     tracks."""
     from tracks import _build_crossing_partner_csr
+    read_tracks = osi._track_geometry
+    monkeypatch.setattr(osi, '_track_geometry',
+                        lambda store, tracks: read_tracks(store, tracks, batch_size=batch_size))
     tracks = _lattice(db)
     snapshot = osi.read_snapshot(db, osi.InputRequest())
     outcomes = osi.refresh_links(db, snapshot, reference.fit_config(),
